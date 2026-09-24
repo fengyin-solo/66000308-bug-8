@@ -1,23 +1,23 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, nextTick } from 'vue';
 import { useFEAStore } from '../store/fea';
+import {
+  computeViewTransform,
+  cssToCanvasPos,
+  isClickGesture,
+  pickElement,
+} from '../utils/canvas-view';
 
 const store = useFEAStore();
 const canvas = ref<HTMLCanvasElement>();
 
-let offsetX = 50;
-let offsetY = 50;
+// Pan offset (canvas bitmap px) and zoom factor applied on top of the auto-fit view
+let offsetX = 0;
+let offsetY = 0;
 let scale = 1;
 let isDragging = false;
 let lastMouse = { x: 0, y: 0 };
-
-function worldToScreen(x: number, y: number): [number, number] {
-  return [x * scale + offsetX, y * scale + offsetY];
-}
-
-function screenToWorld(sx: number, sy: number): [number, number] {
-  return [(sx - offsetX) / scale, (sy - offsetY) / scale];
-}
+let downPos = { x: 0, y: 0 };
 
 function draw() {
   const ctx = canvas.value?.getContext('2d');
@@ -39,23 +39,15 @@ function draw() {
     return;
   }
 
-  // Auto-scale to fit
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-  }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
-
-  // Use auto scale only if no manual zoom
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
+  // Auto-fit + manual zoom/pan, shared with the click hit-test
+  const { drawScale, drawOffsetX, drawOffsetY } = computeViewTransform(
+    nodes,
+    W,
+    H,
+    scale,
+    offsetX,
+    offsetY
+  );
 
   function toScreen(x: number, y: number): [number, number] {
     return [x * drawScale + drawOffsetX, y * drawScale + drawOffsetY];
@@ -250,13 +242,22 @@ function draw() {
 function handleMouseDown(e: MouseEvent) {
   isDragging = true;
   lastMouse = { x: e.clientX, y: e.clientY };
+  downPos = { x: e.clientX, y: e.clientY };
 }
 
 function handleMouseMove(e: MouseEvent) {
   if (!isDragging) return;
-  offsetX += e.clientX - lastMouse.x;
-  offsetY += e.clientY - lastMouse.y;
+  const dx = e.clientX - lastMouse.x;
+  const dy = e.clientY - lastMouse.y;
   lastMouse = { x: e.clientX, y: e.clientY };
+
+  // Ignore sub-threshold jitter so an intended click doesn't nudge the view
+  if (isClickGesture(downPos.x, downPos.y, e.clientX, e.clientY)) return;
+
+  // Pan deltas are in CSS px; convert to bitmap px so the view tracks the cursor
+  const rect = canvas.value!.getBoundingClientRect();
+  offsetX += (dx / rect.width) * canvas.value!.width;
+  offsetY += (dy / rect.height) * canvas.value!.height;
   draw();
 }
 
@@ -273,60 +274,25 @@ function handleWheel(e: WheelEvent) {
 }
 
 function handleClick(e: MouseEvent) {
-  const rect = canvas.value!.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  // A press-drag-release gesture is a pan, not a selection click:
+  // leave the current selection untouched.
+  if (!isClickGesture(downPos.x, downPos.y, e.clientX, e.clientY)) return;
 
   const { nodes, elements } = store.model;
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-  }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
-  const W = canvas.value!.width;
-  const H = canvas.value!.height;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
+  if (nodes.length === 0) return;
 
-  // Find nearest element
-  let bestDist = 15;
-  let bestId: number | null = null;
+  const rect = canvas.value!.getBoundingClientRect();
+  const [mx, my] = cssToCanvasPos(
+    e.clientX - rect.left,
+    e.clientY - rect.top,
+    rect.width,
+    rect.height,
+    canvas.value!.width,
+    canvas.value!.height
+  );
+  const t = computeViewTransform(nodes, canvas.value!.width, canvas.value!.height, scale, offsetX, offsetY);
 
-  for (const el of elements) {
-    const n1 = nodes.find((n) => n.id === el.nodeIds[0]);
-    const n2 = nodes.find((n) => n.id === el.nodeIds[1]);
-    if (!n1 || !n2) continue;
-
-    const x1 = n1.x * drawScale + drawOffsetX;
-    const y1 = n1.y * drawScale + drawOffsetY;
-    const x2 = n2.x * drawScale + drawOffsetX;
-    const y2 = n2.y * drawScale + drawOffsetY;
-
-    // Point-to-segment distance
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const len2 = dx * dx + dy * dy;
-    if (len2 === 0) continue;
-    let t = ((mx - x1) * dx + (my - y1) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    const px = x1 + t * dx;
-    const py = y1 + t * dy;
-    const dist = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
-
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestId = el.id;
-    }
-  }
-
-  store.selectElement(bestId);
+  store.selectElement(pickElement(nodes, elements, mx, my, t));
   draw();
 }
 

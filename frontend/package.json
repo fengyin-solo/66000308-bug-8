@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:picking": "sucrase-node scripts/verify-canvas-picking.ts"
   },
   "dependencies": {
     "vue": "^3.4.0",
