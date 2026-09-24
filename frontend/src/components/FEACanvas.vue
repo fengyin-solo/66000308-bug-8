@@ -5,18 +5,58 @@ import { useFEAStore } from '../store/fea';
 const store = useFEAStore();
 const canvas = ref<HTMLCanvasElement>();
 
-let offsetX = 50;
-let offsetY = 50;
-let scale = 1;
+let panX = 0;
+let panY = 0;
+let zoom = 1;
 let isDragging = false;
+let dragMoved = false;
 let lastMouse = { x: 0, y: 0 };
+let dragStart = { x: 0, y: 0 };
 
-function worldToScreen(x: number, y: number): [number, number] {
-  return [x * scale + offsetX, y * scale + offsetY];
+const MARGIN = 60;
+const HIT_TOLERANCE = 15; // CSS pixels
+const DRAG_THRESHOLD = 3; // CSS pixels
+
+function modelBounds() {
+  const { nodes } = store.model;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x);
+    maxX = Math.max(maxX, n.x);
+    minY = Math.min(minY, n.y);
+    maxY = Math.max(maxY, n.y);
+  }
+  return { minX, maxX, minY, maxY, worldW: maxX - minX || 1, worldH: maxY - minY || 1 };
 }
 
-function screenToWorld(sx: number, sy: number): [number, number] {
-  return [(sx - offsetX) / scale, (sy - offsetY) / scale];
+// Single source of truth for the world→screen transform, shared by rendering
+// and hit-testing so picked elements always match what is drawn. All offsets
+// are in canvas-bitmap pixels.
+function computeView() {
+  const c = canvas.value;
+  if (!c || store.model.nodes.length === 0) return null;
+  const W = c.width;
+  const H = c.height;
+  const b = modelBounds();
+  const fitScale = Math.min(
+    (W - MARGIN * 2) / b.worldW,
+    (H - MARGIN * 2) / b.worldH
+  );
+  const s = fitScale * zoom;
+  const baseX = MARGIN - b.minX * s + (W - MARGIN * 2 - b.worldW * s) / 2;
+  const baseY = MARGIN - b.minY * s + (H - MARGIN * 2 - b.worldH * s) / 2;
+  return { s, baseX, baseY, ox: baseX + panX, oy: baseY + panY };
+}
+
+// Map a mouse/wheel event to canvas-bitmap pixel coordinates, accounting for
+// the difference between the CSS display size and the canvas bitmap size.
+function eventToCanvas(e: MouseEvent | WheelEvent): [number, number] {
+  const c = canvas.value!;
+  const rect = c.getBoundingClientRect();
+  return [
+    ((e.clientX - rect.left) / rect.width) * c.width,
+    ((e.clientY - rect.top) / rect.height) * c.height,
+  ];
 }
 
 function draw() {
@@ -39,26 +79,11 @@ function draw() {
     return;
   }
 
-  // Auto-scale to fit
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-  }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
-
-  // Use auto scale only if no manual zoom
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
+  const view = computeView();
+  if (!view) return;
 
   function toScreen(x: number, y: number): [number, number] {
-    return [x * drawScale + drawOffsetX, y * drawScale + drawOffsetY];
+    return [x * view.s + view.ox, y * view.s + view.oy];
   }
 
   // Draw elements with heatmap colors
@@ -249,13 +274,32 @@ function draw() {
 
 function handleMouseDown(e: MouseEvent) {
   isDragging = true;
+  dragMoved = false;
+  dragStart = { x: e.clientX, y: e.clientY };
   lastMouse = { x: e.clientX, y: e.clientY };
 }
 
 function handleMouseMove(e: MouseEvent) {
   if (!isDragging) return;
-  offsetX += e.clientX - lastMouse.x;
-  offsetY += e.clientY - lastMouse.y;
+
+  // Convert CSS-pixel movement to bitmap-pixel movement so pan stays aligned
+  // with the actual drawing regardless of the canvas display size.
+  const c = canvas.value!;
+  const rect = c.getBoundingClientRect();
+  const scaleX = c.width / rect.width;
+  const scaleY = c.height / rect.height;
+  const dx = (e.clientX - lastMouse.x) * scaleX;
+  const dy = (e.clientY - lastMouse.y) * scaleY;
+
+  if (
+    !dragMoved &&
+    Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) >= DRAG_THRESHOLD
+  ) {
+    dragMoved = true;
+  }
+
+  panX += dx;
+  panY += dy;
   lastMouse = { x: e.clientX, y: e.clientY };
   draw();
 }
@@ -266,37 +310,39 @@ function handleMouseUp() {
 
 function handleWheel(e: WheelEvent) {
   e.preventDefault();
+  if (store.model.nodes.length === 0) return;
+
   const factor = e.deltaY > 0 ? 0.9 : 1.1;
-  scale *= factor;
-  scale = Math.max(0.1, Math.min(10, scale));
+  const newZoom = Math.max(0.1, Math.min(10, zoom * factor));
+
+  // Zoom around the cursor: keep the world point under the cursor stationary
+  // by adjusting pan to compensate.
+  const view = computeView();
+  if (view) {
+    const [cx, cy] = eventToCanvas(e);
+    panX = cx - (newZoom / zoom) * (cx - view.ox) - view.baseX;
+    panY = cy - (newZoom / zoom) * (cy - view.oy) - view.baseY;
+  }
+  zoom = newZoom;
   draw();
 }
 
 function handleClick(e: MouseEvent) {
-  const rect = canvas.value!.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  // A mouseup after a drag fires click too — panning must never change the
+  // selection, neither mid-drag nor on release.
+  if (dragMoved || store.model.nodes.length === 0) return;
+
+  const view = computeView();
+  if (!view) return;
+
+  const [mx, my] = eventToCanvas(e);
 
   const { nodes, elements } = store.model;
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const n of nodes) {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-  }
-  const worldW = maxX - minX || 1;
-  const worldH = maxY - minY || 1;
-  const W = canvas.value!.width;
-  const H = canvas.value!.height;
-  const margin = 60;
-  const fitScale = Math.min((W - margin * 2) / worldW, (H - margin * 2) / worldH);
-  const drawScale = fitScale * scale;
-  const drawOffsetX = margin - minX * drawScale + (W - margin * 2 - worldW * drawScale) / 2;
-  const drawOffsetY = margin - minY * drawScale + (H - margin * 2 - worldH * drawScale) / 2;
 
-  // Find nearest element
-  let bestDist = 15;
+  // Tolerance specified in CSS pixels so it feels identical at any display size.
+  const c = canvas.value!;
+  const rect = c.getBoundingClientRect();
+  const bestDist = HIT_TOLERANCE * (c.width / rect.width);
   let bestId: number | null = null;
 
   for (const el of elements) {
@@ -304,10 +350,10 @@ function handleClick(e: MouseEvent) {
     const n2 = nodes.find((n) => n.id === el.nodeIds[1]);
     if (!n1 || !n2) continue;
 
-    const x1 = n1.x * drawScale + drawOffsetX;
-    const y1 = n1.y * drawScale + drawOffsetY;
-    const x2 = n2.x * drawScale + drawOffsetX;
-    const y2 = n2.y * drawScale + drawOffsetY;
+    const x1 = n1.x * view.s + view.ox;
+    const y1 = n1.y * view.s + view.oy;
+    const x2 = n2.x * view.s + view.ox;
+    const y2 = n2.y * view.s + view.oy;
 
     // Point-to-segment distance
     const dx = x2 - x1;
@@ -321,18 +367,32 @@ function handleClick(e: MouseEvent) {
     const dist = Math.sqrt((mx - px) ** 2 + (my - py) ** 2);
 
     if (dist < bestDist) {
-      bestDist = dist;
       bestId = el.id;
     }
   }
 
-  store.selectElement(bestId);
+  // A real click on an element toggles it; clicking empty space near nothing
+  // leaves the current selection untouched.
+  if (bestId !== null) {
+    store.selectElement(store.selectedElement === bestId ? null : bestId);
+  }
   draw();
 }
 
 onMounted(() => {
   nextTick(draw);
 });
+
+// Reset view when a different model is loaded (reference replaced).
+watch(
+  () => store.model,
+  () => {
+    panX = 0;
+    panY = 0;
+    zoom = 1;
+    nextTick(draw);
+  }
+);
 
 watch(
   () => [
@@ -354,7 +414,8 @@ watch(
     ref="canvas"
     width="800"
     height="500"
-    class="w-full rounded-lg border border-slate-700 cursor-crosshair"
+    class="w-full rounded-lg border border-slate-700"
+    :class="isDragging ? 'cursor-grabbing' : 'cursor-grab'"
     @mousedown="handleMouseDown"
     @mousemove="handleMouseMove"
     @mouseup="handleMouseUp"
